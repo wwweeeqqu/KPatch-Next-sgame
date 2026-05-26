@@ -39,9 +39,9 @@ static __attribute__((noinline)) void *my_memcpy(void *dst, const void *src, uns
 #define memset my_memset
 #define memcpy my_memcpy
 
-struct pid; struct task_struct;
-enum pid_type { PIDTYPE_PID, PIDTYPE_TGID, PIDTYPE_PGID, PIDTYPE_SID, PIDTYPE_MAX };
-struct pid_namespace;
+/* v19: drop manual forward decls — <linux/sched.h> brings them in
+ * (struct pid, struct task_struct, enum pid_type via <linux/pid.h>).
+ */
 
 typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
 typedef long (*copy_from_user_nofault_t)(void *, const void __user *, unsigned long);
