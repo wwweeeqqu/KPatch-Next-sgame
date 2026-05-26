@@ -17,13 +17,36 @@
 #include <linux/printk.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
-#include <linux/sched.h>
 #include <kputils.h>
 #include <kallsyms.h>
 #include <uapi/asm-generic/unistd.h>
 #include <syscall.h>
 #include <asm/ptrace.h>
 #include <asm/current.h>
+
+/* v19: avoid <linux/sched.h> (pulls in pid.h, spinlock.h, etc. — causes
+ * unresolved __aarch64_swp4_sync / __aarch64_ldadd4_sync / memset / strlen
+ * at module load). Inline only the fields and accessor we need.
+ *
+ * Layout MUST match kernel/linux/include/linux/sched.h:struct task_struct_offset
+ * up through comm_offset. Fields after that are unused here.
+ */
+#define TASK_COMM_LEN 16
+struct task_struct_offset_min {
+    int16_t pid_offset;
+    int16_t tgid_offset;
+    int16_t thread_pid_offset;
+    int16_t ptracer_cred_offset;
+    int16_t real_cred_offset;
+    int16_t cred_offset;
+    int16_t comm_offset;
+};
+extern struct task_struct_offset_min task_struct_offset;
+
+static inline const char *kpm_get_task_comm(struct task_struct *task)
+{
+    return (const char *)(((uintptr_t)task) + task_struct_offset.comm_offset);
+}
 
 KPM_NAME("sgame-acepeek-v19");
 KPM_VERSION("0.19.0");
@@ -39,9 +62,9 @@ static __attribute__((noinline)) void *my_memcpy(void *dst, const void *src, uns
 #define memset my_memset
 #define memcpy my_memcpy
 
-/* v19: drop manual forward decls — <linux/sched.h> brings them in
- * (struct pid, struct task_struct, enum pid_type via <linux/pid.h>).
- */
+struct pid; struct task_struct;
+enum pid_type { PIDTYPE_PID, PIDTYPE_TGID, PIDTYPE_PGID, PIDTYPE_SID, PIDTYPE_MAX };
+struct pid_namespace;
 
 typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
 typedef long (*copy_from_user_nofault_t)(void *, const void __user *, unsigned long);
@@ -150,7 +173,7 @@ static int is_or_become_sgame(void)
     pid_t tgid = task_pid_nr_ns_fn(task, PIDTYPE_TGID, 0);
     if (tgid <= 0) return 0;
     if (tgid == ace_sgame_tgid) return 1;
-    const char *comm = get_task_comm(task);
+    const char *comm = kpm_get_task_comm(task);
     if (!comm) return 0;
     if (!comm_is_sgame(comm)) return 0;
     ace_sgame_tgid = tgid;
