@@ -609,7 +609,7 @@ static long sgs_init(const char *args, const char *event, void *__user reserved)
     /* v18 new hooks */
     hook_err_t e5 = inline_hook_syscalln(__NR_faccessat, 3, before_faccessat, 0, 0);
     hook_err_t e6 = inline_hook_syscalln(__NR_faccessat2, 4, before_faccessat2, 0, 0);
-    hook_err_t e7 = inline_hook_syscalln(__NR_newfstatat, 4, before_newfstatat, 0, 0);
+    hook_err_t e7 = inline_hook_syscalln(__NR3264_fstatat, 4, before_newfstatat, 0, 0);
     hook_err_t e8 = inline_hook_syscalln(__NR_statx, 5, before_statx, 0, 0);
     pr_info("[fakemem-v18] hooks: fchmodat=%d openat=%d read=%d close=%d faccessat=%d faccessat2=%d newfstatat=%d statx=%d\n",
             e1, e2, e3, e4, e5, e6, e7, e8);
@@ -624,7 +624,7 @@ static long sgs_exit(void *__user reserved)
     inline_unhook_syscalln(__NR_close, before_close, 0);
     inline_unhook_syscalln(__NR_faccessat, before_faccessat, 0);
     inline_unhook_syscalln(__NR_faccessat2, before_faccessat2, 0);
-    inline_unhook_syscalln(__NR_newfstatat, before_newfstatat, 0);
+    inline_unhook_syscalln(__NR3264_fstatat, before_newfstatat, 0);
     inline_unhook_syscalln(__NR_statx, before_statx, 0);
     pr_info("[fakemem-v18] exit reads=%llu lines_removed=%llu hide_access=%llu hide_stat=%llu hide_open=%llu\n",
             total_reads, fake_lines_removed,
