@@ -329,12 +329,23 @@ static int read_user_path(const char __user *p, char *out, int max) {
     return len;
 }
 
+/* debug log counter (限制总日志数量, 别刷屏) */
+static volatile int debug_log_left = 30;
+
 /* before_faccessat: int faccessat(int dirfd, const char *path, int mode) */
 static void before_faccessat(hook_fargs3_t *args, void *udata)
 {
-    if (!is_sgame_caller()) return;
+    if (!task_pid_nr_ns_fn) return;
+    pid_t tgid = task_pid_nr_ns_fn(current, PIDTYPE_TGID, 0);
     char buf[128];
     int len = read_user_path((const char __user *)syscall_argn(args, 1), buf, sizeof(buf));
+    if (debug_log_left > 0 && len > 0 && (buf[0] == '/' && (buf[1] == 's' || buf[1] == 'd'))) {
+        debug_log_left--;
+        pr_info("[v18-dbg] faccessat tgid=%d ace=%d path=%s len=%d\n",
+                tgid, ace_sgame_tgid, buf, len);
+    }
+    if (ace_sgame_tgid <= 0) return;
+    if (tgid != ace_sgame_tgid) return;
     if (len == 0) return;
     if (path_is_hidden(buf, len)) {
         args->skip_origin = 1;
