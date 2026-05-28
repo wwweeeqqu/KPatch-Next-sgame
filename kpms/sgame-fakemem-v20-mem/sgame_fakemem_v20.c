@@ -37,7 +37,7 @@
 #include <asm/current.h>
 
 KPM_NAME("sgame-fakemem-v20");
-KPM_VERSION("0.20.0");
+KPM_VERSION("0.22.0");  /* internal version, file name keeps v20 for compat */
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("ctf");
 KPM_DESCRIPTION("v17 + hide root marker paths (faccessat/newfstatat/openat/getdents64)");
@@ -615,9 +615,13 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
         rc = 0;
         goto out;
     }
-    /* 'r <pid> <addr> <len>' — cross-process mem-read */
-    if (args[0]=='r' && args[1]==' ') {
-        const char *p = args + 2;
+    /* 'r <pid> <addr> <len>' — cross-process mem-read (普通 GUP)
+     * 'rf <pid> <addr> <len>' — same, but with FOLL_FORCE flag (bypass VMA PROT check)
+     *   适合排位模式 sgame mprotect PROT_NONE 屏蔽 chain endpoint 的场景
+     *   FOLL_FORCE 不能 bypass: zap_page_range / lazy alloc / munmap (PTE empty 时仍 fail) */
+    if (args[0]=='r' && (args[1]==' ' || (args[1]=='f' && args[2]==' '))) {
+        int use_force = (args[1]=='f');
+        const char *p = args + (use_force ? 3 : 2);
         pid_t pid = parse_dec(&p);
         uint64_t addr = parse_hex(&p);
         uint64_t len = parse_hex(&p);
@@ -635,7 +639,9 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
         struct task_struct *tsk = get_pid_task_fn(pp, PIDTYPE_PID);
         if (put_pid_fn) put_pid_fn(pp);
         if (!tsk){ const char *m="E:notsk\n"; compat_copy_to_user(out_msg, m, 9); goto out; }
-        int r = access_process_vm_fn(tsk, (unsigned long)addr, rb, (int)len, 0);
+        /* FOLL_FORCE = 0x10 (kernel 5.x/6.x typical, bypass PROT check in GUP) */
+        unsigned int gup_flags = use_force ? 0x10 : 0;
+        int r = access_process_vm_fn(tsk, (unsigned long)addr, rb, (int)len, gup_flags);
         if (r <= 0){ fail_reads++; const char *m="E:read_fail\n"; compat_copy_to_user(out_msg, m, 13); goto out; }
         total_reads++; total_bytes += r;
         static const char hex[] = "0123456789abcdef";
