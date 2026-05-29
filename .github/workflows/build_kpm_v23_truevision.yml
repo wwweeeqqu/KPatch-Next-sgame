@@ -1,0 +1,46 @@
+name: Build sgame-truevision v23 KPM
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'kpms/sgame-truevision-v23/**'
+      - '.github/workflows/build_kpm_v23_truevision.yml'
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 1
+
+      - name: Install aarch64 toolchain
+        run: |
+          curl -L -o tc.tar.xz \
+            "https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz"
+          tar -Jxf tc.tar.xz
+
+      - name: Build kernel headers (make hdr)
+        run: |
+          export TARGET_COMPILE="$(pwd)/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+          cd kernel
+          make hdr
+
+      - name: Build v23 KPM
+        run: |
+          export TARGET_COMPILE="$(pwd)/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+          cd kpms/sgame-truevision-v23
+          make
+          ls -la *.kpm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgame-truevision-v23
+          path: kpms/sgame-truevision-v23/sgame-truevision-v23.kpm
+          if-no-files-found: error
