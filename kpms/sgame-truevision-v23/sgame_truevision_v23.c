@@ -217,6 +217,9 @@ static void tv_fill_attr(struct tv_perf_attr *a, uint64_t va, uint32_t bp_type, 
     my_memset(a, 0, sizeof(*a));
     a->type    = 5;                 /* PERF_TYPE_BREAKPOINT */
     a->size    = (uint32_t)sizeof(*a); /* 0x80 */
+    a->period  = 1;                 /* ★ sample_period=1 (canonical hw_breakpoint_init): kernel-counter
+                                     * overflow handler is only invoked when the event overflows; =0
+                                     * counts but never calls our handler -> tv_hits stayed 0. */
     a->bp_type = bp_type;           /* 4=X exec / 2=W data watchpoint */
     a->bp_addr = va;                /* exec: 4-aligned code VA; watch: data VA */
     a->bp_len  = bp_len;            /* exec=4 (kernel req), watch=8 */
