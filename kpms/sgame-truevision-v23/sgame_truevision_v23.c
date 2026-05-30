@@ -81,15 +81,21 @@ typedef void (*perf_overflow_handler_t)(struct perf_event *, struct perf_sample_
 typedef struct perf_event *(*reg_user_hwbp_t)(void *attr, perf_overflow_handler_t, void *ctx, struct task_struct *tsk);
 typedef void (*unreg_hwbp_t)(struct perf_event *);
 typedef void (*put_task_struct_t)(struct task_struct *);
+typedef int  (*perf_event_enable_t)(struct perf_event *);   /* arm-disabled-then-enable fix */
+typedef void (*perf_event_disable_t)(struct perf_event *);
 
 static reg_user_hwbp_t reg_user_hwbp_fn = 0;
 static unreg_hwbp_t unreg_hwbp_fn = 0;
 static put_task_struct_t put_task_struct_fn = 0;  /* __put_task_struct (raw final-free) */
+static perf_event_enable_t perf_event_enable_fn = 0;
+static perf_event_disable_t perf_event_disable_fn = 0;
 
 /* perf_event_attr — 与 sgame-sniff perf_attr_v61 字节布局一致 (mainline 6.1 UAPI):
- * bp_type@0x34, bp_addr@0x38, bp_len@0x40, size=0x80. 用裸 u64 flags (避免 bitfield
- * 顺序歧义); flags=0x64 = pinned(bit2)|exclude_kernel(bit5)|exclude_hv(bit6), disabled(bit0)=0,
- * exclude_user(bit4)=0 (setter 在 EL0 跑, 不能排除 user). */
+ * bp_type@0x34, bp_addr@0x38, bp_len@0x40, size=0x80. 用裸 u64 flags.
+ * ★ 2026-05-30 修法: flags=0x65 = disabled(bit0)=1 | pinned(bit2) | exclude_kernel(bit5) |
+ *   exclude_hv(bit6). disabled=1 镜像已验证不卡的 RT 6.1.ko (我们旧 0x64=disabled=0 立即跨CPU
+ *   IPI 安装 → step-over 竞争 → 无限重触发 RCU stall, 见 sgame-hwbp-armwedge-2026-05-30).
+ *   arm 时不触发; 之后 tvenable 从非原子 ctl0 调 perf_event_enable 走正常 task-ctx 调度装硬件. */
 struct tv_perf_attr {
     uint32_t type;        /* 0x00 = 5 (PERF_TYPE_BREAKPOINT) */
     uint32_t size;        /* 0x04 = 0x80 */
@@ -105,7 +111,9 @@ struct tv_perf_attr {
     uint8_t  rest[0x80 - 0x48]; /* 0x48..0x7f reserved */
 };
 
-#define TV_FLAGS_USER_EXEC 0x64ULL  /* pinned|exclude_kernel|exclude_hv */
+#define TV_FLAGS_DISARMED 0x65ULL  /* disabled|pinned|exclude_kernel|exclude_hv (arm OFF, enable later) */
+#define TV_BP_EXEC  4   /* HW_BREAKPOINT_X */
+#define TV_BP_WRITE 2   /* HW_BREAKPOINT_W (data watchpoint — wedge-immune) */
 
 #define TV_MAX_BPS 256
 struct tv_bp { int in_use; pid_t tid; struct perf_event *ev; struct task_struct *tsk; volatile uint64_t hits; };
@@ -118,8 +126,11 @@ static struct tv_cap g_caps[TV_CAP_N];
 
 static volatile uint64_t tv_total_hits = 0;   /* total BP fires processed */
 static volatile uint64_t tv_cfu_fail = 0;     /* x1 deref faulted -> dropped */
-static volatile uint64_t tv_bp_va = 0;        /* armed setter VA (status) */
-static volatile int      tv_armed = 0;        /* # perf_events currently armed */
+static volatile uint64_t tv_bp_va = 0;        /* armed setter/data VA (status) */
+static volatile uint64_t tv_first_fire_pc = 0;/* PC of the FIRST fire (reader detects firing fast) */
+static volatile uint64_t tv_hit_cap = 500;    /* handler does heavy work only for first N fires (bound runaway) */
+static volatile int      tv_armed = 0;        /* # perf_events currently registered */
+static volatile int      tv_enabled = 0;      /* # perf_events enabled via tvenable */
 static volatile int      g_usage_off = 0;     /* task_struct->usage offset; 0 = leak ref (safe), set via tvcfg after D2 */
 
 /* SAFE task-ref release. perf holds its OWN ref after register; we drop ONLY ours.
@@ -141,8 +152,13 @@ static void tv_put_task(struct task_struct *t)
 static void tv_bp_handler(struct perf_event *ev, struct perf_sample_data *sd, struct pt_regs *regs)
 {
     if (!regs) return;
-    uint64_t c   = regs->regs[0];   /* x0 = c (ActorNode) */
-    uint64_t src = regs->regs[1];   /* x1 = ptr -> source VInt3 (12B) */
+    /* count EVERY fire first (reader polls this to detect firing immediately + issue tvoff). */
+    uint64_t n = __sync_fetch_and_add(&tv_total_hits, 1);
+    if (tv_first_fire_pc == 0) tv_first_fire_pc = regs->pc;   /* sanity: where it fired */
+    if (n >= tv_hit_cap) return;             /* safety neuter: bound handler work past cap */
+
+    uint64_t c   = regs->regs[0];   /* x0 = c (ActorNode) — valid for EXEC BP at setter entry */
+    uint64_t src = regs->regs[1];   /* x1 = ptr -> source VInt3 (12B) — EXEC BP only */
     if (!c || !src) return;
     if (src >= 0x800000000000ULL) return;   /* user-range guard */
     if (!copy_from_user_nofault_fn) return;
@@ -151,7 +167,6 @@ static void tv_bp_handler(struct perf_event *ev, struct perf_sample_data *sd, st
         __sync_fetch_and_add(&tv_cfu_fail, 1);
         return;                              /* faulted -> DISCARD (iron law) */
     }
-    __sync_fetch_and_add(&tv_total_hits, 1);
 
     /* attribute the fire to its bp slot (-> tid), pure pointer scan */
     pid_t tid = 0;
@@ -183,22 +198,24 @@ static void tv_bp_handler(struct perf_event *ev, struct perf_sample_data *sd, st
     /* table full (>64 distinct c) -> drop. ~10 entities => never full. */
 }
 
-static void tv_fill_attr(struct tv_perf_attr *a, uint64_t va)
+static void tv_fill_attr(struct tv_perf_attr *a, uint64_t va, uint32_t bp_type, uint64_t bp_len)
 {
     my_memset(a, 0, sizeof(*a));
     a->type    = 5;                 /* PERF_TYPE_BREAKPOINT */
     a->size    = (uint32_t)sizeof(*a); /* 0x80 */
-    a->bp_type = 4;                 /* HW_BREAKPOINT_X (execute) */
-    a->bp_addr = va;                /* 4-byte aligned A64 instruction VA */
-    a->bp_len  = 4;                 /* HW_BREAKPOINT_LEN_4 (required for exec) */
-    a->flags   = TV_FLAGS_USER_EXEC;/* pinned|exclude_kernel|exclude_hv, disabled=0 */
+    a->bp_type = bp_type;           /* 4=X exec / 2=W data watchpoint */
+    a->bp_addr = va;                /* exec: 4-aligned code VA; watch: data VA */
+    a->bp_len  = bp_len;            /* exec=4 (kernel req), watch=8 */
+    a->flags   = TV_FLAGS_DISARMED; /* disabled=1: arm OFF, enable later via tvenable */
 }
 
-/* arm one per-task exec BP on tid @ va. Keeps OUR task ref in the slot (released at tvoff). */
-static int tv_arm_one(pid_t tid, uint64_t va)
+/* arm one per-task BP (disabled) on tid @ va. Keeps OUR task ref in the slot (released at tvoff).
+ * bp_type: 4=exec(X) / 2=write-watchpoint(W). Event is created DISABLED; call tvenable to fire. */
+static int tv_arm_one(pid_t tid, uint64_t va, uint32_t bp_type, uint64_t bp_len)
 {
     if (!reg_user_hwbp_fn || !find_get_pid_fn || !get_pid_task_fn) return -1;
-    if (va == 0 || va >= 0x800000000000ULL || (va & 3)) return -2;
+    if (va == 0 || va >= 0x800000000000ULL) return -2;
+    if (bp_type == TV_BP_EXEC && (va & 3)) return -2;   /* exec must be 4-aligned */
     int slot = -1;
     for (int i = 0; i < TV_MAX_BPS; i++) if (!g_bps[i].in_use) { slot = i; break; }
     if (slot < 0) return -3;
@@ -208,7 +225,7 @@ static int tv_arm_one(pid_t tid, uint64_t va)
     if (put_pid_fn) put_pid_fn(pp);
     if (!tsk) return -5;
     struct tv_perf_attr attr;
-    tv_fill_attr(&attr, va);
+    tv_fill_attr(&attr, va, bp_type, bp_len);
     struct perf_event *ev = reg_user_hwbp_fn((void *)&attr, tv_bp_handler, 0, tsk);
     if (!ev || ((long)ev >= -4095L && (long)ev < 0)) {
         tv_put_task(tsk);           /* register failed -> drop our ref (safe) */
@@ -227,6 +244,7 @@ static void tv_disarm_all(void)
 {
     for (int i = 0; i < TV_MAX_BPS; i++) {
         if (!g_bps[i].in_use) continue;
+        if (perf_event_disable_fn && g_bps[i].ev) perf_event_disable_fn(g_bps[i].ev); /* stop firing first */
         if (unreg_hwbp_fn && g_bps[i].ev) unreg_hwbp_fn(g_bps[i].ev);  /* drops perf's ref */
         tv_put_task(g_bps[i].tsk);                                    /* then drop OUR ref */
         g_bps[i].in_use = 0; g_bps[i].ev = 0; g_bps[i].tsk = 0; g_bps[i].tid = 0; g_bps[i].hits = 0;
@@ -235,7 +253,8 @@ static void tv_disarm_all(void)
         g_caps[i].c = 0; g_caps[i].v[0] = g_caps[i].v[1] = g_caps[i].v[2] = 0;
         g_caps[i].tid = 0; g_caps[i].hits = 0;
     }
-    tv_armed = 0; tv_total_hits = 0; tv_cfu_fail = 0; tv_bp_va = 0;
+    tv_armed = 0; tv_enabled = 0; tv_total_hits = 0; tv_cfu_fail = 0;
+    tv_bp_va = 0; tv_first_fire_pc = 0;
 }
 
 static volatile uint64_t total_openat = 0;
@@ -663,7 +682,9 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
         n += u64_to_str((uint64_t)(ace_sgame_tgid > 0 ? ace_sgame_tgid : 0), buf+n);
         buf[n++]=' ';
         p="tv_armed="; while(*p)buf[n++]=*p++; n += u64_to_str((uint64_t)tv_armed, buf+n); buf[n++]=' ';
+        p="tv_enabled="; while(*p)buf[n++]=*p++; n += u64_to_str((uint64_t)tv_enabled, buf+n); buf[n++]=' ';
         p="tv_hits="; while(*p)buf[n++]=*p++; n += u64_to_str(tv_total_hits, buf+n); buf[n++]=' ';
+        p="tv_fired="; while(*p)buf[n++]=*p++; n += u64_to_str((uint64_t)(tv_first_fire_pc!=0), buf+n); buf[n++]=' ';
         p="tv_cfu_fail="; while(*p)buf[n++]=*p++; n += u64_to_str(tv_cfu_fail, buf+n); buf[n++]=' ';
         p="tv_usageoff="; while(*p)buf[n++]=*p++; n += u64_to_str((uint64_t)(g_usage_off>0?g_usage_off:0), buf+n);
         buf[n++]='\n'; buf[n]=0;
@@ -856,17 +877,66 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
             if (*p < '0' || *p > '9') break;
             pid_t tid = parse_dec(&p);
             if (tid <= 0) continue;
-            int rc2 = tv_arm_one(tid, va);
+            int rc2 = tv_arm_one(tid, va, TV_BP_EXEC, 4);   /* exec, DISABLED (tvenable to fire) */
             if (rc2 >= 0) regd++; else failed++;
         }
         char *buf = g_outbuf; int n = 0;
-        const char *m = "TVON: bp=0x"; while (*m) buf[n++] = *m++;
+        const char *m = "TVON(exec,disabled): bp=0x"; while (*m) buf[n++] = *m++;
         { static const char hx[]="0123456789abcdef"; char hb[16]; int hi=0; uint64_t vv=va;
           if (!vv) hb[hi++]='0'; else while (vv) { hb[hi++]=hx[vv&0xf]; vv>>=4; }
           for (int j=hi-1;j>=0;j--) buf[n++]=hb[j]; }
         m=" regd="; while (*m) buf[n++]=*m++; n += u64_to_str((uint64_t)regd, buf+n);
         m=" failed="; while (*m) buf[n++]=*m++; n += u64_to_str((uint64_t)failed, buf+n);
         m=" armed="; while (*m) buf[n++]=*m++; n += u64_to_str((uint64_t)tv_armed, buf+n);
+        buf[n++]='\n'; buf[n]=0;
+        compat_copy_to_user(out_msg, buf, n+1);
+        rc = 0; goto out;
+    }
+    /* tvwon <data_hex_va> <tid1> <tid2> ... — arm WRITE WATCHPOINT (disabled) on data VA.
+     * Watchpoint fires AFTER the store completes -> wedge-immune (safe probe). */
+    if (args[0]=='t' && args[1]=='v' && args[2]=='w' && args[3]=='o' && args[4]=='n') {
+        const char *p = args + 5;
+        uint64_t va = parse_hex(&p);
+        if (va == 0) { const char *m="E:tvwon_noaddr\n"; compat_copy_to_user(out_msg, m, 15); goto out; }
+        if (tv_armed == 0) {
+            for (int i = 0; i < TV_CAP_N; i++) { g_caps[i].c = 0; g_caps[i].hits = 0; g_caps[i].tid = 0; }
+            tv_total_hits = 0; tv_cfu_fail = 0; tv_first_fire_pc = 0;
+        }
+        tv_bp_va = va;
+        int regd = 0, failed = 0;
+        while (1) {
+            while (*p == ' ') p++;
+            if (*p < '0' || *p > '9') break;
+            pid_t tid = parse_dec(&p);
+            if (tid <= 0) continue;
+            int rc2 = tv_arm_one(tid, va, TV_BP_WRITE, 8);   /* write watchpoint, DISABLED */
+            if (rc2 >= 0) regd++; else failed++;
+        }
+        char *buf = g_outbuf; int n = 0;
+        const char *m = "TVWON(watch,disabled): d=0x"; while (*m) buf[n++]=*m++;
+        { static const char hx[]="0123456789abcdef"; char hb[16]; int hi=0; uint64_t vv=va;
+          if (!vv) hb[hi++]='0'; else while (vv) { hb[hi++]=hx[vv&0xf]; vv>>=4; }
+          for (int j=hi-1;j>=0;j--) buf[n++]=hb[j]; }
+        m=" regd="; while (*m) buf[n++]=*m++; n += u64_to_str((uint64_t)regd, buf+n);
+        m=" failed="; while (*m) buf[n++]=*m++; n += u64_to_str((uint64_t)failed, buf+n);
+        buf[n++]='\n'; buf[n]=0;
+        compat_copy_to_user(out_msg, buf, n+1);
+        rc = 0; goto out;
+    }
+    /* tvenable — enable all armed (disabled) events via perf_event_enable (non-atomic ctl0 ctx).
+     * THIS is the step that actually arms hardware + can fire. Have power button ready (exec). */
+    if (args[0]=='t' && args[1]=='v' && args[2]=='e' && args[3]=='n' && args[4]=='a') {
+        int en = 0;
+        if (perf_event_enable_fn) {
+            for (int i = 0; i < TV_MAX_BPS; i++) {
+                if (g_bps[i].in_use && g_bps[i].ev) { perf_event_enable_fn(g_bps[i].ev); en++; }
+            }
+        }
+        tv_enabled = en;
+        char *buf = g_outbuf; int n = 0;
+        const char *m;
+        if (!perf_event_enable_fn) { m = "E:no_perf_event_enable\n"; while (*m) buf[n++]=*m++; }
+        else { m = "TVENABLE: enabled="; while (*m) buf[n++]=*m++; n += u64_to_str((uint64_t)en, buf+n); }
         buf[n++]='\n'; buf[n]=0;
         compat_copy_to_user(out_msg, buf, n+1);
         rc = 0; goto out;
@@ -962,9 +1032,13 @@ static long sgs_init(const char *args, const char *event, void *__user reserved)
     reg_user_hwbp_fn = (reg_user_hwbp_t)kallsyms_lookup_name("register_user_hw_breakpoint");
     unreg_hwbp_fn = (unreg_hwbp_t)kallsyms_lookup_name("unregister_hw_breakpoint");
     put_task_struct_fn = (put_task_struct_t)kallsyms_lookup_name("__put_task_struct");
+    perf_event_enable_fn = (perf_event_enable_t)kallsyms_lookup_name("perf_event_enable");
+    perf_event_disable_fn = (perf_event_disable_t)kallsyms_lookup_name("perf_event_disable");
     pr_info("[truevision-v23] hwbp: reg=%llx unreg=%llx put_task=%llx (usage_off=%d 0=leak-safe)\n",
             (uint64_t)reg_user_hwbp_fn, (uint64_t)unreg_hwbp_fn,
             (uint64_t)put_task_struct_fn, g_usage_off);
+    pr_info("[truevision-v23] hwbp: perf_enable=%llx perf_disable=%llx (0=>tvenable dead, use watchpoint or pivot)\n",
+            (uint64_t)perf_event_enable_fn, (uint64_t)perf_event_disable_fn);
 
     for (int i = 0; i < MAX_FAKE_FDS; i++) fake_fds[i].active = 0;
     hide_paths_count = 0;
