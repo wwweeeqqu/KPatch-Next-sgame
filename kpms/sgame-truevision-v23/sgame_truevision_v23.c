@@ -83,12 +83,26 @@ typedef void (*unreg_hwbp_t)(struct perf_event *);
 typedef void (*put_task_struct_t)(struct task_struct *);
 typedef int  (*perf_event_enable_t)(struct perf_event *);   /* arm-disabled-then-enable fix */
 typedef void (*perf_event_disable_t)(struct perf_event *);
+typedef void (*rcu_lock_t)(void);   /* __rcu_read_lock / __rcu_read_unlock */
 
 static reg_user_hwbp_t reg_user_hwbp_fn = 0;
 static unreg_hwbp_t unreg_hwbp_fn = 0;
 static put_task_struct_t put_task_struct_fn = 0;  /* __put_task_struct (raw final-free) */
 static perf_event_enable_t perf_event_enable_fn = 0;
 static perf_event_disable_t perf_event_disable_fn = 0;
+static rcu_lock_t rcu_read_lock_fn = 0;
+static rcu_lock_t rcu_read_unlock_fn = 0;
+
+/* ★ ROOT-CAUSE FIX (2026-05-30): KPatch calls our ctl0 INSIDE rcu_read_lock()
+ * (module.c module_control0 line 534..562). register_user_hw_breakpoint /
+ * perf_event_enable / unregister do a cross-task perf install (cross-CPU IPI +
+ * wait); doing that while holding rcu_read_lock stalls the RCU grace period ->
+ * RCU stall -> whole-kernel wedge (proven: userspace perf_event_open with NO
+ * rcu lock works perfectly). So we EXIT the RCU section around every perf op.
+ * NOTE: only safe because we never `kpm unload` while a tv op is in flight
+ * (during the unlock window the module could otherwise be freed under us). */
+static void tv_rcu_exit(void) { if (rcu_read_unlock_fn) rcu_read_unlock_fn(); }
+static void tv_rcu_enter(void) { if (rcu_read_lock_fn) rcu_read_lock_fn(); }
 
 /* perf_event_attr — 与 sgame-sniff perf_attr_v61 字节布局一致 (mainline 6.1 UAPI):
  * bp_type@0x34, bp_addr@0x38, bp_len@0x40, size=0x80. 用裸 u64 flags.
@@ -872,6 +886,7 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
         }
         tv_bp_va = va;
         int regd = 0, failed = 0;
+        tv_rcu_exit();   /* ★ exit KPatch's rcu_read_lock — perf install must not run in RCU */
         while (1) {
             while (*p == ' ') p++;
             if (*p < '0' || *p > '9') break;
@@ -880,6 +895,7 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
             int rc2 = tv_arm_one(tid, va, TV_BP_EXEC, 4);   /* exec, DISABLED (tvenable to fire) */
             if (rc2 >= 0) regd++; else failed++;
         }
+        tv_rcu_enter();  /* re-enter so module_control0's rcu_read_unlock balances */
         char *buf = g_outbuf; int n = 0;
         const char *m = "TVON(exec,disabled): bp=0x"; while (*m) buf[n++] = *m++;
         { static const char hx[]="0123456789abcdef"; char hb[16]; int hi=0; uint64_t vv=va;
@@ -904,6 +920,7 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
         }
         tv_bp_va = va;
         int regd = 0, failed = 0;
+        tv_rcu_exit();   /* ★ exit RCU around perf install */
         while (1) {
             while (*p == ' ') p++;
             if (*p < '0' || *p > '9') break;
@@ -912,6 +929,7 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
             int rc2 = tv_arm_one(tid, va, TV_BP_WRITE, 8);   /* write watchpoint, DISABLED */
             if (rc2 >= 0) regd++; else failed++;
         }
+        tv_rcu_enter();
         char *buf = g_outbuf; int n = 0;
         const char *m = "TVWON(watch,disabled): d=0x"; while (*m) buf[n++]=*m++;
         { static const char hx[]="0123456789abcdef"; char hb[16]; int hi=0; uint64_t vv=va;
@@ -927,11 +945,13 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
      * THIS is the step that actually arms hardware + can fire. Have power button ready (exec). */
     if (args[0]=='t' && args[1]=='v' && args[2]=='e' && args[3]=='n' && args[4]=='a') {
         int en = 0;
+        tv_rcu_exit();   /* ★ perf_event_enable schedules/IPIs — must not run in RCU */
         if (perf_event_enable_fn) {
             for (int i = 0; i < TV_MAX_BPS; i++) {
                 if (g_bps[i].in_use && g_bps[i].ev) { perf_event_enable_fn(g_bps[i].ev); en++; }
             }
         }
+        tv_rcu_enter();
         tv_enabled = en;
         char *buf = g_outbuf; int n = 0;
         const char *m;
@@ -977,7 +997,9 @@ static long sgs_ctl0(const char *args, char *__user out_msg, int outlen)
     /* tvoff — unregister all BPs + clear tables. */
     if (args[0]=='t' && args[1]=='v' && args[2]=='o' && args[3]=='f' && args[4]=='f') {
         int was = tv_armed;
+        tv_rcu_exit();   /* ★ unregister/perf_event_disable schedule/IPI — must not run in RCU */
         tv_disarm_all();
+        tv_rcu_enter();
         char *buf = g_outbuf; int n = 0;
         const char *m = "TVOFF: unregd="; while (*m) buf[n++]=*m++;
         n += u64_to_str((uint64_t)was, buf+n);
@@ -1034,11 +1056,14 @@ static long sgs_init(const char *args, const char *event, void *__user reserved)
     put_task_struct_fn = (put_task_struct_t)kallsyms_lookup_name("__put_task_struct");
     perf_event_enable_fn = (perf_event_enable_t)kallsyms_lookup_name("perf_event_enable");
     perf_event_disable_fn = (perf_event_disable_t)kallsyms_lookup_name("perf_event_disable");
+    rcu_read_lock_fn = (rcu_lock_t)kallsyms_lookup_name("__rcu_read_lock");
+    rcu_read_unlock_fn = (rcu_lock_t)kallsyms_lookup_name("__rcu_read_unlock");
     pr_info("[truevision-v23] hwbp: reg=%llx unreg=%llx put_task=%llx (usage_off=%d 0=leak-safe)\n",
             (uint64_t)reg_user_hwbp_fn, (uint64_t)unreg_hwbp_fn,
             (uint64_t)put_task_struct_fn, g_usage_off);
-    pr_info("[truevision-v23] hwbp: perf_enable=%llx perf_disable=%llx (0=>tvenable dead, use watchpoint or pivot)\n",
-            (uint64_t)perf_event_enable_fn, (uint64_t)perf_event_disable_fn);
+    pr_info("[truevision-v23] hwbp: perf_enable=%llx perf_disable=%llx rcu_lock=%llx rcu_unlock=%llx\n",
+            (uint64_t)perf_event_enable_fn, (uint64_t)perf_event_disable_fn,
+            (uint64_t)rcu_read_lock_fn, (uint64_t)rcu_read_unlock_fn);
 
     for (int i = 0; i < MAX_FAKE_FDS; i++) fake_fds[i].active = 0;
     hide_paths_count = 0;
