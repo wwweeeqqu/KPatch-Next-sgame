@@ -106,10 +106,10 @@ static void tv_rcu_enter(void) { if (rcu_read_lock_fn) rcu_read_lock_fn(); }
 
 /* perf_event_attr — 与 sgame-sniff perf_attr_v61 字节布局一致 (mainline 6.1 UAPI):
  * bp_type@0x34, bp_addr@0x38, bp_len@0x40, size=0x80. 用裸 u64 flags.
- * ★ 2026-05-30 修法: flags=0x65 = disabled(bit0)=1 | pinned(bit2) | exclude_kernel(bit5) |
- *   exclude_hv(bit6). disabled=1 镜像已验证不卡的 RT 6.1.ko (我们旧 0x64=disabled=0 立即跨CPU
- *   IPI 安装 → step-over 竞争 → 无限重触发 RCU stall, 见 sgame-hwbp-armwedge-2026-05-30).
- *   arm 时不触发; 之后 tvenable 从非原子 ctl0 调 perf_event_enable 走正常 task-ctx 调度装硬件. */
+ * ★ 2026-05-30 真修法 = RCU bracket (见 tv_rcu_exit). flags=0x64 = disabled(bit0)=0 |
+ *   pinned(bit2) | exclude_kernel(bit5) | exclude_hv(bit6). disabled=0 = register_user_hw_breakpoint
+ *   直接 install+activate (内核计数器的正确用法; 实测 disabled=1+perf_event_enable 对"内核计数器+
+ *   另一个task"不真安装硬件, tv_hits=0 不触发). 之前 disabled=0 卡是 RCU 锁的锅, 非 disabled bit. */
 struct tv_perf_attr {
     uint32_t type;        /* 0x00 = 5 (PERF_TYPE_BREAKPOINT) */
     uint32_t size;        /* 0x04 = 0x80 */
@@ -125,7 +125,7 @@ struct tv_perf_attr {
     uint8_t  rest[0x80 - 0x48]; /* 0x48..0x7f reserved */
 };
 
-#define TV_FLAGS_DISARMED 0x65ULL  /* disabled|pinned|exclude_kernel|exclude_hv (arm OFF, enable later) */
+#define TV_FLAGS_ARM 0x64ULL  /* pinned|exclude_kernel|exclude_hv, disabled=0 (register installs+activates) */
 #define TV_BP_EXEC  4   /* HW_BREAKPOINT_X */
 #define TV_BP_WRITE 2   /* HW_BREAKPOINT_W (data watchpoint — wedge-immune) */
 
@@ -220,7 +220,7 @@ static void tv_fill_attr(struct tv_perf_attr *a, uint64_t va, uint32_t bp_type, 
     a->bp_type = bp_type;           /* 4=X exec / 2=W data watchpoint */
     a->bp_addr = va;                /* exec: 4-aligned code VA; watch: data VA */
     a->bp_len  = bp_len;            /* exec=4 (kernel req), watch=8 */
-    a->flags   = TV_FLAGS_DISARMED; /* disabled=1: arm OFF, enable later via tvenable */
+    a->flags   = TV_FLAGS_ARM;      /* disabled=0: register installs + activates immediately */
 }
 
 /* arm one per-task BP (disabled) on tid @ va. Keeps OUR task ref in the slot (released at tvoff).
